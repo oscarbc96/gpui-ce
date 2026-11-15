@@ -218,14 +218,11 @@ fn solid_quad(
     color: Hsla,
 ) -> Quad {
     Quad {
-        order: 0,
-        border_style: BorderStyle::Solid,
         bounds,
         content_mask: *content_mask,
         background: color.into(),
         border_color: transparent_black().into(),
-        corner_radii: Corners::default(),
-        border_widths: Edges::default(),
+        ..Default::default()
     }
 }
 

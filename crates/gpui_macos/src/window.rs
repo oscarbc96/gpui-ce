@@ -824,6 +824,9 @@ struct MacWindowState {
     /// clears it before a frame and parks the display link if it is still clear
     /// afterwards, so an idle window causes no per-vsync wakeups.
     frame_demand: Arc<AtomicBool>,
+    /// Keeps the display link running briefly after the last frame with demand, so
+    /// input right after a frame does not wait for the link to restart (up to a vsync).
+    idle_grace: IdleGrace,
     renderer: renderer::Renderer,
     /// Forces an uncached scene after GPU recovery or a transient presentation failure.
     force_render_pending: bool,
@@ -1276,6 +1279,7 @@ impl MacWindow {
                 cursor_visible,
                 frame_source: None,
                 frame_demand: Arc::new(AtomicBool::new(true)),
+                idle_grace: IdleGrace::default(),
                 renderer,
                 force_render_pending: false,
                 request_frame_callback: None,
@@ -3439,7 +3443,10 @@ extern "C" fn step(view: *mut c_void) {
             // gpui wakes the frame source whenever demand remains after a frame
             // (dirty window, pending next-frame callbacks, throttled retry).
             // Without it the window is idle: park the display link.
-            if !demand.load(Ordering::Acquire) {
+            let now = std::time::Instant::now();
+            if demand.load(Ordering::Acquire) {
+                lock.idle_grace.note_demand(now);
+            } else if lock.idle_grace.should_park(now) {
                 lock.stop_display_link();
             }
         }
@@ -4056,9 +4063,42 @@ unsafe extern "C" fn toggle_tab_bar(this: &Objc2Object, _sel: Sel, _id: ObjcId) 
     }
 }
 
+/// How long the display link keeps ticking after the last frame that had demand.
+const IDLE_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Time-based idle grace: no timers, evaluated only inside `step`.
+#[derive(Default)]
+struct IdleGrace {
+    last_demand: Option<std::time::Instant>,
+}
+
+impl IdleGrace {
+    fn note_demand(&mut self, now: std::time::Instant) {
+        self.last_demand = Some(now);
+    }
+
+    /// True once `IDLE_GRACE` has passed since the last frame with demand.
+    fn should_park(&mut self, now: std::time::Instant) -> bool {
+        let last = *self.last_demand.get_or_insert(now);
+        now.saturating_duration_since(last) >= IDLE_GRACE
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_grace_parks_only_after_grace_period() {
+        let t0 = std::time::Instant::now();
+        let mut grace = IdleGrace::default();
+        grace.note_demand(t0);
+        assert!(!grace.should_park(t0 + std::time::Duration::from_millis(16)));
+        assert!(!grace.should_park(t0 + std::time::Duration::from_millis(249)));
+        assert!(grace.should_park(t0 + IDLE_GRACE));
+        grace.note_demand(t0 + IDLE_GRACE);
+        assert!(!grace.should_park(t0 + IDLE_GRACE + std::time::Duration::from_millis(16)));
+    }
 
     #[test]
     fn display_id_for_screen_returns_none_for_null_screen() {
