@@ -820,6 +820,10 @@ struct MacWindowState {
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
+    /// Set by the frame waker whenever gpui reports pending frame demand; `step`
+    /// clears it before a frame and parks the display link if it is still clear
+    /// afterwards, so an idle window causes no per-vsync wakeups.
+    frame_demand: Arc<AtomicBool>,
     renderer: renderer::Renderer,
     /// Forces an uncached scene after GPU recovery or a transient presentation failure.
     force_render_pending: bool,
@@ -1009,6 +1013,16 @@ impl MacWindowState {
             .get_or_insert_with(|| WindowFrameSource::new(data, step))
             .start(display_id)
             .log_err();
+    }
+
+    fn ensure_display_link(&mut self) {
+        if !self
+            .frame_source
+            .as_ref()
+            .is_some_and(|source| source.is_running())
+        {
+            self.start_display_link();
+        }
     }
 
     fn stop_display_link(&mut self) {
@@ -1261,6 +1275,7 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
+                frame_demand: Arc::new(AtomicBool::new(true)),
                 renderer,
                 force_render_pending: false,
                 request_frame_callback: None,
@@ -2045,6 +2060,23 @@ impl PlatformWindow for MacWindow {
 
     fn is_simple_fullscreen(&self) -> bool {
         self.0.lock().simple_fullscreen_state.is_some()
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let (demand, weak) = {
+            let state = self.0.lock();
+            (state.frame_demand.clone(), Arc::downgrade(&self.0))
+        };
+        Some(Rc::new(move || {
+            demand.store(true, Ordering::Release);
+            let weak = weak.clone();
+            // Never lock the window state here: the waker can run while it is held.
+            DispatchQueue::main().exec_async(move || {
+                if let Some(state) = weak.upgrade() {
+                    state.lock().ensure_display_link();
+                }
+            });
+        }))
     }
 
     fn is_fullscreen(&self) -> bool {
@@ -3398,9 +3430,18 @@ extern "C" fn step(view: *mut c_void) {
 
         if let Some(mut callback) = lock.request_frame_callback.take() {
             let request = lock.next_frame_request();
+            let demand = lock.frame_demand.clone();
+            demand.store(false, Ordering::Release);
             drop(lock);
             callback(request);
-            window_state.lock().request_frame_callback = Some(callback);
+            let mut lock = window_state.lock();
+            lock.request_frame_callback = Some(callback);
+            // gpui wakes the frame source whenever demand remains after a frame
+            // (dirty window, pending next-frame callbacks, throttled retry).
+            // Without it the window is idle: park the display link.
+            if !demand.load(Ordering::Acquire) {
+                lock.stop_display_link();
+            }
         }
     }
 }
