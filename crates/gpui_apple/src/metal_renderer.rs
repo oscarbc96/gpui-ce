@@ -176,7 +176,7 @@ pub struct InstanceBufferPool {
 impl Default for InstanceBufferPool {
     fn default() -> Self {
         Self {
-            buffer_size: 2 * 1024 * 1024,
+            buffer_size: 1024 * 1024,
             buffers: Vec::new(),
         }
     }
@@ -290,7 +290,9 @@ impl MetalRenderer {
         let layer = new_window_layer(transparent);
         layer.set_device(&device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-        layer.set_maximum_drawable_count(3);
+        // Two drawables are enough for a UI toolkit and save a full-window
+        // surface (about 12 MB on a 1100 x 700 window at 2x) over three.
+        layer.set_maximum_drawable_count(2);
         // Allow texture reading for visual tests (captures screenshots without ScreenCaptureKit)
         #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
         layer.set_framebuffer_only(false);

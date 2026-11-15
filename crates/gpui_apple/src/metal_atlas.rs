@@ -159,16 +159,19 @@ impl MetalAtlasState {
         min_size: Size<DevicePixels>,
         kind: AtlasTextureKind,
     ) -> &mut MetalAtlasTexture {
-        const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
-            width: DevicePixels(1024),
-            height: DevicePixels(1024),
+        // A 1024 x 1024 BGRA atlas is 4 MB of shared memory, committed as soon
+        // as the first emoji or image is drawn (1 MB for the glyph atlas).
+        // Start both at 512 x 512; further textures are added when one fills up.
+        let default_atlas_size = Size {
+            width: DevicePixels(512),
+            height: DevicePixels(512),
         };
         // Max texture size on all modern Apple GPUs. Anything bigger than that crashes in validateWithDevice.
         const MAX_ATLAS_SIZE: Size<DevicePixels> = Size {
             width: DevicePixels(16384),
             height: DevicePixels(16384),
         };
-        let size = min_size.min(&MAX_ATLAS_SIZE).max(&DEFAULT_ATLAS_SIZE);
+        let size = min_size.min(&MAX_ATLAS_SIZE).max(&default_atlas_size);
         let texture_descriptor = metal::TextureDescriptor::new();
         texture_descriptor.set_width(size.width.into());
         texture_descriptor.set_height(size.height.into());
@@ -389,8 +392,8 @@ mod tests {
             height: DevicePixels(64),
         };
         let big = Size {
-            width: DevicePixels(700),
-            height: DevicePixels(700),
+            width: DevicePixels(400),
+            height: DevicePixels(400),
         };
 
         let keeper_key = make_image_key(1, 0);
@@ -404,6 +407,33 @@ mod tests {
         atlas.remove(&big_key_a);
         let tile_b = insert_tile(&atlas, &big_key_b, big);
         assert_eq!(tile_b.texture_id, keeper_tile.texture_id);
+    }
+
+    #[test]
+    fn atlas_textures_start_small_and_grow_by_adding_textures() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let small = Size {
+            width: DevicePixels(64),
+            height: DevicePixels(64),
+        };
+        let first = insert_tile(&atlas, &make_image_key(1, 0), small);
+        let texture = atlas.metal_texture(first.texture_id);
+        assert_eq!(
+            (texture.width(), texture.height()),
+            (512, 512),
+            "a 1024 x 1024 color atlas is 4 MB committed by the first emoji"
+        );
+
+        // A tile that does not fit goes to another, larger-if-needed texture.
+        let wide = Size {
+            width: DevicePixels(700),
+            height: DevicePixels(700),
+        };
+        let second = insert_tile(&atlas, &make_image_key(2, 0), wide);
+        assert_ne!(first.texture_id, second.texture_id);
+        assert_eq!(atlas.metal_texture(second.texture_id).width(), 700);
     }
 
     #[test]
