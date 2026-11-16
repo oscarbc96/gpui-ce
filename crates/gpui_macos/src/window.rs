@@ -3435,18 +3435,22 @@ extern "C" fn step(view: *mut c_void) {
         if let Some(mut callback) = lock.request_frame_callback.take() {
             let request = lock.next_frame_request();
             let demand = lock.frame_demand.clone();
-            demand.store(false, Ordering::Release);
+            // Demand set since the last tick (input, an invalidation) asked
+            // for this frame.
+            let requested = demand.swap(false, Ordering::AcqRel);
             drop(lock);
             callback(request);
             let mut lock = window_state.lock();
             lock.request_frame_callback = Some(callback);
             // gpui wakes the frame source whenever demand remains after a frame
             // (dirty window, pending next-frame callbacks, throttled retry).
-            // Without it the window is idle: park the display link.
-            let now = std::time::Instant::now();
-            if demand.load(Ordering::Acquire) {
-                lock.idle_grace.note_demand(now);
-            } else if lock.idle_grace.should_park(now) {
+            // Without either the window is idle: park the display link once
+            // the grace period has passed.
+            let remains = demand.load(Ordering::Acquire);
+            if lock
+                .idle_grace
+                .after_frame(requested, remains, std::time::Instant::now())
+            {
                 lock.stop_display_link();
             }
         }
@@ -4073,12 +4077,18 @@ struct IdleGrace {
 }
 
 impl IdleGrace {
-    fn note_demand(&mut self, now: std::time::Instant) {
-        self.last_demand = Some(now);
-    }
-
-    /// True once `IDLE_GRACE` has passed since the last frame with demand.
-    fn should_park(&mut self, now: std::time::Instant) -> bool {
+    /// Records a frame and returns true when the display link should park.
+    /// A frame has demand when something asked for it (`requested`: input or
+    /// an invalidation woke the link since the last tick) or when demand is
+    /// left after it (`remains`: animation, a throttled retry). The link parks
+    /// once `IDLE_GRACE` has passed since the last frame with demand. Counting
+    /// only `remains` parks the link after every frame of input that arrives at
+    /// the display rate, so each next event waits for a link restart.
+    fn after_frame(&mut self, requested: bool, remains: bool, now: std::time::Instant) -> bool {
+        if requested || remains {
+            self.last_demand = Some(now);
+            return false;
+        }
         let last = *self.last_demand.get_or_insert(now);
         now.saturating_duration_since(last) >= IDLE_GRACE
     }
@@ -4092,12 +4102,34 @@ mod tests {
     fn idle_grace_parks_only_after_grace_period() {
         let t0 = std::time::Instant::now();
         let mut grace = IdleGrace::default();
-        grace.note_demand(t0);
-        assert!(!grace.should_park(t0 + std::time::Duration::from_millis(16)));
-        assert!(!grace.should_park(t0 + std::time::Duration::from_millis(249)));
-        assert!(grace.should_park(t0 + IDLE_GRACE));
-        grace.note_demand(t0 + IDLE_GRACE);
-        assert!(!grace.should_park(t0 + IDLE_GRACE + std::time::Duration::from_millis(16)));
+        assert!(!grace.after_frame(false, true, t0));
+        assert!(!grace.after_frame(false, false, t0 + std::time::Duration::from_millis(16)));
+        assert!(!grace.after_frame(false, false, t0 + std::time::Duration::from_millis(249)));
+        assert!(grace.after_frame(false, false, t0 + IDLE_GRACE));
+        assert!(!grace.after_frame(false, true, t0 + IDLE_GRACE));
+        assert!(!grace.after_frame(
+            false,
+            false,
+            t0 + IDLE_GRACE + std::time::Duration::from_millis(16)
+        ));
+    }
+
+    #[test]
+    fn idle_grace_counts_frames_that_input_requested() {
+        // Input at the display rate: each event wakes the link, its frame draws
+        // it and leaves no demand behind. Those frames still had demand, so the
+        // link must keep ticking; parking after each one makes every next
+        // event wait for a link restart (a skipped vsync).
+        let ms = std::time::Duration::from_millis;
+        let t0 = std::time::Instant::now();
+        let mut grace = IdleGrace::default();
+        for i in 0..100u64 {
+            let now = t0 + std::time::Duration::from_micros(8333 * i);
+            assert!(!grace.after_frame(true, false, now), "parked at frame {i}");
+        }
+        let last = t0 + std::time::Duration::from_micros(8333 * 99);
+        assert!(!grace.after_frame(false, false, last + ms(100)));
+        assert!(grace.after_frame(false, false, last + IDLE_GRACE));
     }
 
     #[test]
