@@ -31,6 +31,7 @@ core-foundation.workspace = true
 core-graphics.workspace = true
 core-video.workspace = true
 derive_more.workspace = true
+dispatch2 = "0.3.1"
 etagere.workspace = true
 foreign-types.workspace = true
 image.workspace = true

@@ -28,6 +28,7 @@ use core_video::{
     metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
     pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
 };
+use dispatch2::{DispatchQoS, DispatchQueue, GlobalQueueIdentifier};
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
     CAMetalLayer, CommandQueue, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions, MTLScissorRect,
@@ -38,7 +39,16 @@ use parking_lot::Mutex;
 use smallvec::SmallVec;
 use wgsl_rs::std::{vec2f, vec4f};
 
-use std::{cell::Cell, mem, ptr, sync::Arc};
+use std::{
+    cell::Cell,
+    mem, ptr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+/// Longest stretch [`MetalRenderer::draw`] skips presents while it waits for
+/// the prefetched drawable; after it, the main thread waits for one.
+const SKIP_PRESENT_LIMIT: Duration = Duration::from_millis(50);
 
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
@@ -231,6 +241,22 @@ impl InstanceBufferPool {
     }
 }
 
+/// A drawable fetched off the main thread for the next frame.
+#[derive(Default)]
+struct DrawablePrefetch {
+    drawable: Option<metal::MetalDrawable>,
+    /// A background fetch is waiting in `next_drawable`.
+    fetching: bool,
+    /// Cleared while the window is idle, so no spare drawable is kept.
+    enabled: bool,
+}
+
+enum Acquired {
+    Ready(metal::MetalDrawable),
+    Skip,
+    Failed,
+}
+
 pub struct MetalRenderer {
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
@@ -240,6 +266,13 @@ pub struct MetalRenderer {
     /// The layer's drawable size while [`MetalRenderer::release_idle_drawables`]
     /// has shrunk it; restored by the next draw.
     idle_drawable_size: Option<CGSize>,
+    /// The next drawable, fetched on a background queue after each present.
+    prefetch: Arc<Mutex<DrawablePrefetch>>,
+    /// When a frame was last presented; bounds how long presents are skipped.
+    last_present: Option<Instant>,
+    /// Set when [`MetalRenderer::draw`] skipped the present because no
+    /// drawable was free yet; the window presents again on the next frame.
+    present_skipped: bool,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -293,9 +326,11 @@ impl MetalRenderer {
         let layer = new_window_layer(transparent);
         layer.set_device(&device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-        // Two drawables are enough for a UI toolkit and save a full-window
-        // surface (about 12 MB on a 1100 x 700 window at 2x) over three.
-        layer.set_maximum_drawable_count(2);
+        // Three drawables: one on screen, one queued in the compositor and
+        // one fetched ahead for the next frame (see `acquire_drawable`). With
+        // two, every frame waited for the compositor on the main thread. The
+        // idle path still frees the spare drawables.
+        layer.set_maximum_drawable_count(3);
         // Allow texture reading for visual tests (captures screenshots without ScreenCaptureKit)
         #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
         layer.set_framebuffer_only(false);
@@ -499,6 +534,9 @@ impl MetalRenderer {
             layer,
             presents_with_transaction: false,
             idle_drawable_size: None,
+            prefetch: Arc::default(),
+            last_present: None,
+            present_skipped: false,
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -567,10 +605,82 @@ impl MetalRenderer {
         let Some(layer) = &self.layer else {
             return;
         };
+        {
+            let mut prefetch = self.prefetch.lock();
+            prefetch.enabled = false;
+            prefetch.drawable = None;
+        }
         if self.idle_drawable_size.is_none() {
             self.idle_drawable_size = Some(layer.drawable_size());
             layer.set_drawable_size(CGSize::new(1.0, 1.0));
         }
+    }
+
+    /// The drawable for the next frame. `next_drawable` blocks until the
+    /// compositor releases one, which with a full queue is the next vsync:
+    /// waiting on the main thread made the frame cadence follow the
+    /// compositor instead of the display link, so every vsync the compositor
+    /// missed also delayed the next frame (and its input). The drawable is
+    /// therefore fetched on a background queue after each present. `Skip`
+    /// means that fetch is still waiting: the window presents the latest
+    /// scene on the next frame instead. A synchronous present (resize) never
+    /// skips, nor does a frame [`SKIP_PRESENT_LIMIT`] after the last present.
+    fn acquire_drawable(&mut self, layer: &metal::MetalLayer) -> Acquired {
+        let size = layer.drawable_size();
+        let mut prefetch = self.prefetch.lock();
+        prefetch.enabled = true;
+        if let Some(drawable) = prefetch.drawable.take() {
+            let texture = drawable.texture();
+            // A resize since the fetch leaves a drawable of the old size.
+            if texture.width() as f64 == size.width && texture.height() as f64 == size.height {
+                return Acquired::Ready(drawable);
+            }
+        }
+        let fetching = prefetch.fetching;
+        drop(prefetch);
+        if fetching
+            && !self.presents_with_transaction
+            && self
+                .last_present
+                .is_some_and(|t| t.elapsed() < SKIP_PRESENT_LIMIT)
+        {
+            return Acquired::Skip;
+        }
+        match layer.next_drawable() {
+            Some(drawable) => Acquired::Ready(drawable.to_owned()),
+            None => Acquired::Failed,
+        }
+    }
+
+    /// Starts fetching the drawable for the next frame off the main thread.
+    fn prefetch_drawable(&self, layer: &metal::MetalLayer) {
+        let mut prefetch = self.prefetch.lock();
+        if prefetch.fetching || prefetch.drawable.is_some() || !prefetch.enabled {
+            return;
+        }
+        prefetch.fetching = true;
+        drop(prefetch);
+        let state = self.prefetch.clone();
+        let layer = layer.clone();
+        DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(
+            DispatchQoS::UserInteractive,
+        ))
+        .exec_async(move || {
+            let drawable =
+                objc2::rc::autoreleasepool(|_| layer.next_drawable().map(|d| d.to_owned()));
+            let mut prefetch = state.lock();
+            prefetch.fetching = false;
+            // An idle window does not keep a spare drawable.
+            if prefetch.enabled {
+                prefetch.drawable = drawable;
+            }
+        });
+    }
+
+    /// Whether the last [`MetalRenderer::draw`] skipped its present; clears
+    /// the flag.
+    pub fn take_present_skipped(&mut self) -> bool {
+        mem::take(&mut self.present_skipped)
     }
 
     fn restore_idle_drawables(&mut self) {
@@ -702,15 +812,21 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
-        let drawable = if let Some(drawable) = layer.next_drawable() {
-            drawable
-        } else {
-            log::error!(
-                "failed to retrieve next drawable, drawable size: {:?}",
-                viewport_size
-            );
-            return;
+        let drawable = match self.acquire_drawable(&layer) {
+            Acquired::Ready(drawable) => drawable,
+            Acquired::Skip => {
+                self.present_skipped = true;
+                return;
+            }
+            Acquired::Failed => {
+                log::error!(
+                    "failed to retrieve next drawable, drawable size: {:?}",
+                    viewport_size
+                );
+                return;
+            }
         };
+        let drawable: &metal::MetalDrawableRef = &drawable;
 
         let mut instance_buffer = self.acquire_instance_buffer(scene);
         let command_buffer =
@@ -723,6 +839,7 @@ impl MetalRenderer {
             };
         self.release_instance_buffer_when_complete(&command_buffer, instance_buffer);
 
+        self.last_present = Some(Instant::now());
         if self.presents_with_transaction {
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
@@ -730,6 +847,7 @@ impl MetalRenderer {
         } else {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
+            self.prefetch_drawable(&layer);
         }
     }
 
