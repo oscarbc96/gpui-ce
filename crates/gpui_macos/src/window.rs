@@ -3452,6 +3452,7 @@ extern "C" fn step(view: *mut c_void) {
                 .after_frame(requested, remains, std::time::Instant::now())
             {
                 lock.stop_display_link();
+                lock.renderer.release_idle_drawables();
             }
         }
     }

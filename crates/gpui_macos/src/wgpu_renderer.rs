@@ -79,6 +79,10 @@ impl MacWgpuRenderer {
         self.renderer.update_drawable_size(size);
     }
 
+    /// The Metal renderer frees its spare drawable while idle; WGPU owns its
+    /// surface textures, so there is nothing to release here.
+    pub fn release_idle_drawables(&mut self) {}
+
     /// The surface's alpha mode sets the layer's opacity whenever WGPU
     /// configures it, so it must not be set on the layer directly.
     pub fn update_transparency(&mut self, transparent: bool) {
